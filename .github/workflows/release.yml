@@ -184,9 +184,12 @@ jobs:
       run:
         shell: bash
         working-directory: unrest-launcher
-    env:
-      CARGO_TARGET_DIR: ${{ runner.temp }}/launcher-target
     steps:
+      # Outside the checkout, so the build output is easy to find and upload.
+      - name: Choose the build folder
+        working-directory: ${{ github.workspace }}
+        run: echo "CARGO_TARGET_DIR=$RUNNER_TEMP/launcher-target" >> "$GITHUB_ENV"
+
       - name: Mint a read-only token for the source
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
         id: source
