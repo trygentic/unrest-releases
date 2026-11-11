@@ -1,0 +1,278 @@
+name: release
+
+# Builds GameGen and the Unrest Launcher from the private trygentic/unrest
+# source and collects the packages into a DRAFT release in this repository.
+# Nothing here publishes: a person marks the draft public after a smoke test.
+#
+# This repository is public, so these logs are public. The build prints no
+# secrets, and compiler warnings are capped so private source is not quoted,
+# but a failing build can still show file names and error lines.
+#
+# Unsigned for now. Signing and notarization are a later change.
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'Ref in trygentic/unrest to build: main, a v* tag, or a commit SHA.'
+        required: false
+        type: string
+        default: 'main'
+      tag:
+        description: 'Release tag to create as a draft (e.g. v0.25.0-beta.1). Leave empty to build without creating a release.'
+        required: false
+        type: string
+
+# The source checkout uses a token minted from the release bot GitHub App.
+# GITHUB_TOKEN is read-only everywhere except the one job that drafts a release.
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.run_id }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: trygentic/unrest
+  # Do not echo private source in public logs through warnings.
+  RUSTFLAGS: --cap-lints allow
+  CARGO_TERM_COLOR: never
+  CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      # An arbitrary branch would run its build scripts with the source token
+      # in scope, so only main, release tags and exact commits are accepted.
+      - name: Validate inputs
+        env:
+          REF: ${{ inputs.source_ref }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          if [[ "$REF" != "main" && ! "$REF" =~ ^v[0-9] && ! "$REF" =~ ^[0-9a-f]{7,40}$ ]]; then
+            echo "::error::source_ref must be main, a v* tag or a commit SHA"; exit 1
+          fi
+          if [[ -n "$TAG" && ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::tag must look like v1.2.3 or v1.2.3-beta.1"; exit 1
+          fi
+
+  gamegen:
+    needs: validate
+    name: GameGen ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            key: darwin-arm64
+            exe: ''
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            key: win32-x64
+            exe: '.exe'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 150
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Mint a read-only token for the source
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        id: source
+        with:
+          app-id: ${{ vars.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+          owner: trygentic
+          repositories: unrest
+          permission-contents: read
+
+      - name: Check out the source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          token: ${{ steps.source.outputs.token }}
+          ref: ${{ inputs.source_ref }}
+          persist-credentials: false
+          sparse-checkout: |
+            agentloop
+            agentloop-memory
+            scallop
+            packages
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.10
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 25.8.1
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.0
+          targets: ${{ matrix.target }}
+      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+
+      # v8's build script needs Cargo's home on the same drive as the build.
+      # The CRT folder is copied beside the app so it starts on a clean PC.
+      - name: Windows build settings
+        if: runner.os == 'Windows'
+        run: |
+          echo "CARGO_HOME=$(cygpath -w "$RUNNER_TEMP/cargo-home")" >> "$GITHUB_ENV"
+          echo "LIBCLANG_PATH=C:\\Program Files\\LLVM\\bin" >> "$GITHUB_ENV"
+          crt=$(ls -d "/c/Program Files/Microsoft Visual Studio/2022/"*/VC/Redist/MSVC/*/x64/Microsoft.VC143.CRT | sort | tail -1)
+          test -d "$crt"
+          echo "AGENTLOOP_WINDOWS_CRT_DIR=$(cygpath -w "$crt")" >> "$GITHUB_ENV"
+
+      - name: Install locked dependencies
+        working-directory: agentloop
+        run: bun install --frozen-lockfile --ignore-scripts
+
+      - name: Build the daemon and the memory helper
+        working-directory: agentloop
+        env:
+          SCCACHE_GHA_ENABLED: 'true'
+          RUSTC_WRAPPER: sccache
+        run: |
+          cargo build --locked --release --manifest-path crates/Cargo.toml -p agentloop-daemon
+          cargo build --locked --release --manifest-path ../agentloop-memory/Cargo.toml -p am-server --bin agentloop-memory
+          mkdir -p "build-extras/agentloop-daemon/${{ matrix.key }}" "build-extras/agentloop-memory/${{ matrix.key }}"
+          cp "crates/target/release/agentloop-daemon${{ matrix.exe }}" "build-extras/agentloop-daemon/${{ matrix.key }}/"
+          cp "../agentloop-memory/target/release/agentloop-memory${{ matrix.exe }}" "build-extras/agentloop-memory/${{ matrix.key }}/"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            cp crates/target/release/runtime_owner_lease.exe "build-extras/agentloop-daemon/${{ matrix.key }}/"
+          fi
+
+      # The packager refuses a tree with uncommitted changes, so the package
+      # is always exactly the checked-out commit.
+      - name: Package GameGen
+        working-directory: agentloop
+        env:
+          SCCACHE_GHA_ENABLED: 'true'
+          RUSTC_WRAPPER: sccache
+        run: |
+          git -C .. status --porcelain
+          node scripts/package-gamegen-beta.mjs --target=${{ matrix.target }} --output="$RUNNER_TEMP/gamegen"
+          mv "$RUNNER_TEMP/gamegen/gamegen-package.json" "$RUNNER_TEMP/gamegen/gamegen-package-${{ matrix.target }}.json"
+          ls -l "$RUNNER_TEMP/gamegen"
+
+      - name: Keep the package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: gamegen-${{ matrix.target }}
+          path: |
+            ${{ runner.temp }}/gamegen/*.tar.gz
+            ${{ runner.temp }}/gamegen/gamegen-package-*.json
+          if-no-files-found: error
+          retention-days: 14
+
+  launcher:
+    needs: validate
+    name: Launcher ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            target: aarch64-apple-darwin
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+        working-directory: unrest-launcher
+    env:
+      CARGO_TARGET_DIR: ${{ runner.temp }}/launcher-target
+    steps:
+      - name: Mint a read-only token for the source
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        id: source
+        with:
+          app-id: ${{ vars.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+          owner: trygentic
+          repositories: unrest
+          permission-contents: read
+
+      - name: Check out the source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          token: ${{ steps.source.outputs.token }}
+          ref: ${{ inputs.source_ref }}
+          persist-credentials: false
+          sparse-checkout: unrest-launcher
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.10
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: '22'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install locked dependencies
+        run: |
+          bun install --frozen-lockfile --ignore-scripts
+          npm ci --prefix scripts/tauri-toolchain --ignore-scripts --no-audit --no-fund
+
+      - name: Check and build the launcher web bundle
+        run: |
+          bun run check
+          bun run test:release
+          bun scripts/release/validate-product-catalog.ts
+          bun run build:beta:web
+          bun run build:beta:icons
+
+      - name: Package the launcher (unsigned)
+        run: bun scripts/package-beta.ts --target=${{ matrix.target }}
+
+      # macOS: the zipped app. Windows: the NSIS installer.
+      - name: Keep the package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: launcher-${{ matrix.target }}
+          path: |
+            ${{ runner.temp }}/launcher-target/${{ matrix.target }}/release/bundle/macos/*.zip
+            ${{ runner.temp }}/launcher-target/${{ matrix.target }}/release/bundle/nsis/*.exe
+          if-no-files-found: error
+          retention-days: 14
+
+  draft-release:
+    name: Draft release
+    needs: [gamegen, launcher]
+    if: ${{ inputs.tag != '' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - name: Collect the packages
+        uses: actions/download-artifact@v5
+        with:
+          path: packages
+          merge-multiple: true
+
+      # A draft is visible only to people with write access to this repository.
+      # Marking it public is a manual step after the smoke test.
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          REF: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          cd packages
+          ls -l
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+          gh release create "$TAG" * \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --draft --prerelease \
+            --title "Unrest ${TAG#v}" \
+            --notes "Unsigned beta build. macOS: right-click the app and choose Open the first time. Check downloads against SHA256SUMS before running them."
