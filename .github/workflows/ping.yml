@@ -1,0 +1,12 @@
+name: ping
+# Temporary: checks that Actions can start a job in this repository.
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  ping:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - run: echo ok
