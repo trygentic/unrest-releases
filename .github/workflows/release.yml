@@ -2,6 +2,11 @@ name: release
 
 # Builds GameGen and the Unrest Launcher from the private trygentic/unrest
 # source and collects the packages into a DRAFT release in this repository.
+#
+# GameGen is the slow part. It can be built here, or on our own machines by
+# "Release (self-hosted)" in trygentic/unrest and handed over with
+# `gamegen_run_id`. Either way the launcher is built here and all signing
+# happens here, so the signing keys never leave this repository's secrets.
 # Nothing here publishes: a person marks the draft public after a smoke test.
 #
 # This repository is public, so these logs are public. The build prints no
@@ -27,6 +32,10 @@ on:
         default: 'main'
       tag:
         description: 'Release tag to create as a draft (e.g. v0.25.0-beta.1). Leave empty to build without creating a release.'
+        required: false
+        type: string
+      gamegen_run_id:
+        description: 'Optional. Run ID of a successful "Release (self-hosted)" run on main in trygentic/unrest. GameGen is then taken from that run instead of being built here; the launcher is still built, and everything is signed, here.'
         required: false
         type: string
 
@@ -57,6 +66,7 @@ jobs:
         env:
           REF: ${{ inputs.source_ref }}
           TAG: ${{ inputs.tag }}
+          RUN: ${{ inputs.gamegen_run_id }}
         run: |
           if [[ "$REF" != "main" && ! "$REF" =~ ^v[0-9] && ! "$REF" =~ ^[0-9a-f]{7,40}$ ]]; then
             echo "::error::source_ref must be main, a v* tag or a commit SHA"; exit 1
@@ -64,9 +74,13 @@ jobs:
           if [[ -n "$TAG" && ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
             echo "::error::tag must look like v1.2.3 or v1.2.3-beta.1"; exit 1
           fi
+          if [[ -n "$RUN" && ! "$RUN" =~ ^[0-9]+$ ]]; then
+            echo "::error::gamegen_run_id must be a number"; exit 1
+          fi
 
   gamegen:
     needs: validate
+    if: ${{ inputs.gamegen_run_id == '' }}
     name: GameGen ${{ matrix.target }}
     strategy:
       fail-fast: false
@@ -134,6 +148,16 @@ jobs:
           test -d "$crt"
           echo "AGENTLOOP_WINDOWS_CRT_DIR=$(cygpath -w "$crt")" >> "$GITHUB_ENV"
 
+      # Compiled code records the full path of every source file. Rewrite the
+      # machine-specific parts so no user name or folder layout ships.
+      - name: Hide build-machine paths
+        run: |
+          home="$HOME"; work="$GITHUB_WORKSPACE"; cargo="${CARGO_HOME:-$HOME/.cargo}"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            home=$(cygpath -w "$home"); work=$(cygpath -w "$work"); cargo=$(cygpath -w "$cargo")
+          fi
+          echo "RUSTFLAGS=$RUSTFLAGS --remap-path-prefix=$home=~ --remap-path-prefix=$cargo=~/.cargo --remap-path-prefix=$work=/src" >> "$GITHUB_ENV"
+
       - name: Install locked dependencies
         working-directory: agentloop
         run: bun install --frozen-lockfile --ignore-scripts
@@ -176,11 +200,65 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  gamegen-prebuilt:
+    name: GameGen from a self-hosted build
+    needs: validate
+    if: ${{ inputs.gamegen_run_id != '' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      sha: ${{ steps.fetch.outputs.sha }}
+    env:
+      RUN_ID: ${{ inputs.gamegen_run_id }}
+    steps:
+      - name: Mint a read-only token for the build
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        id: read
+        with:
+          app-id: ${{ vars.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+          owner: trygentic
+          repositories: unrest
+          permission-actions: read
+          permission-contents: read
+
+      # Only a finished, successful run of the release workflow on main counts.
+      - name: Verify the build and download its packages
+        id: fetch
+        env:
+          GH_TOKEN: ${{ steps.read.outputs.token }}
+        run: |
+          set -euo pipefail
+          run=$(gh api "repos/$SOURCE_REPO/actions/runs/$RUN_ID")
+          check() { test "$(jq -r "$1" <<<"$run")" = "$2" || { echo "::error::run $RUN_ID: $1 is not $2"; exit 1; }; }
+          check .path .github/workflows/release-selfhosted.yml
+          check .head_branch main
+          check .event workflow_dispatch
+          check .status completed
+          check .conclusion success
+          echo "sha=$(jq -r .head_sha <<<"$run")" >> "$GITHUB_OUTPUT"
+          gh run download "$RUN_ID" --repo "$SOURCE_REPO" --dir "$RUNNER_TEMP/gamegen"
+          ls -lR "$RUNNER_TEMP/gamegen"
+
+      # Re-published under the names the later jobs already expect.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: gamegen-aarch64-apple-darwin
+          path: ${{ runner.temp }}/gamegen/gamegen-aarch64-apple-darwin/
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: gamegen-x86_64-pc-windows-msvc
+          path: ${{ runner.temp }}/gamegen/gamegen-x86_64-pc-windows-msvc/
+          if-no-files-found: error
+          retention-days: 14
+
   catalog:
     name: Sign GameGen and list it for the launcher
-    needs: gamegen
+    needs: [gamegen, gamegen-prebuilt]
     # Signed product lists only make sense for a real, tagged release.
-    if: ${{ inputs.tag != '' && vars.UNREST_PRODUCT_PUBLIC_KEY != '' }}
+    if: ${{ always() && inputs.tag != '' && vars.UNREST_PRODUCT_PUBLIC_KEY != '' && (needs.gamegen.result == 'success' || needs.gamegen-prebuilt.result == 'success') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     defaults:
@@ -202,7 +280,7 @@ jobs:
         with:
           repository: ${{ env.SOURCE_REPO }}
           token: ${{ steps.source.outputs.token }}
-          ref: ${{ inputs.source_ref }}
+          ref: ${{ needs.gamegen-prebuilt.outputs.sha || inputs.source_ref }}
           persist-credentials: false
           sparse-checkout: |
             unrest-launcher
@@ -274,8 +352,8 @@ jobs:
 
   launcher:
     # Runs after the product list when there is one, and without it otherwise.
-    needs: [validate, catalog]
-    if: ${{ always() && needs.validate.result == 'success' && (needs.catalog.result == 'success' || needs.catalog.result == 'skipped') }}
+    needs: [validate, catalog, gamegen-prebuilt]
+    if: ${{ always() && needs.validate.result == 'success' && (needs.catalog.result == 'success' || needs.catalog.result == 'skipped') && needs.gamegen-prebuilt.result != 'failure' }}
     name: Launcher ${{ matrix.target }}
     strategy:
       fail-fast: false
@@ -312,7 +390,7 @@ jobs:
         with:
           repository: ${{ env.SOURCE_REPO }}
           token: ${{ steps.source.outputs.token }}
-          ref: ${{ inputs.source_ref }}
+          ref: ${{ needs.gamegen-prebuilt.outputs.sha || inputs.source_ref }}
           persist-credentials: false
           # `packages` holds the shared UI packages the launcher depends on.
           # One launcher release check imports a helper from agentloop/scripts.
@@ -330,6 +408,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      # Compiled code records the full path of every source file. Rewrite the
+      # machine-specific parts so no user name or folder layout ships.
+      - name: Hide build-machine paths
+        working-directory: ${{ github.workspace }}
+        run: |
+          home="$HOME"; work="$GITHUB_WORKSPACE"; cargo="${CARGO_HOME:-$HOME/.cargo}"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            home=$(cygpath -w "$home"); work=$(cygpath -w "$work"); cargo=$(cygpath -w "$cargo")
+          fi
+          echo "RUSTFLAGS=$RUSTFLAGS --remap-path-prefix=$home=~ --remap-path-prefix=$cargo=~/.cargo --remap-path-prefix=$work=/src" >> "$GITHUB_ENV"
 
       - name: Install locked dependencies
         run: |
@@ -383,8 +472,8 @@ jobs:
 
   draft-release:
     name: Draft release
-    needs: [gamegen, launcher, catalog]
-    if: ${{ always() && inputs.tag != '' && needs.gamegen.result == 'success' && needs.launcher.result == 'success' && (needs.catalog.result == 'success' || needs.catalog.result == 'skipped') }}
+    needs: [gamegen, gamegen-prebuilt, launcher, catalog]
+    if: ${{ always() && inputs.tag != '' && (needs.gamegen.result == 'success' || needs.gamegen-prebuilt.result == 'success') && needs.launcher.result == 'success' && (needs.catalog.result == 'success' || needs.catalog.result == 'skipped') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -419,7 +508,7 @@ jobs:
         with:
           repository: ${{ env.SOURCE_REPO }}
           token: ${{ steps.source.outputs.token }}
-          ref: ${{ inputs.source_ref }}
+          ref: ${{ needs.gamegen-prebuilt.outputs.sha || inputs.source_ref }}
           path: source
           persist-credentials: false
           sparse-checkout: |
