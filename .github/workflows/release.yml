@@ -8,7 +8,14 @@ name: release
 # secrets, and compiler warnings are capped so private source is not quoted,
 # but a failing build can still show file names and error lines.
 #
-# Unsigned for now. Signing and notarization are a later change.
+# The apps are not signed by Apple or Microsoft yet. Update signing is separate
+# and switches on by itself once these exist in this repository's settings:
+#   variables  UNREST_UPDATER_PUBLIC_KEY, UNREST_PRODUCT_PUBLIC_KEY
+#   secrets    UNREST_UPDATER_PRIVATE_KEY, UNREST_PRODUCT_PRIVATE_KEY
+#              (and the matching *_PASSWORD secrets if the keys have one)
+# With them, a tagged run signs the GameGen archives, compiles the list of those
+# archives into the launcher, and signs the launcher's own update archives.
+# Private keys are only ever present in the two signing steps, never in a build.
 
 on:
   workflow_dispatch:
@@ -169,8 +176,106 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  catalog:
+    name: Sign GameGen and list it for the launcher
+    needs: gamegen
+    # Signed product lists only make sense for a real, tagged release.
+    if: ${{ inputs.tag != '' && vars.UNREST_PRODUCT_PUBLIC_KEY != '' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Mint a read-only token for the source
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        id: source
+        with:
+          app-id: ${{ vars.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+          owner: trygentic
+          repositories: unrest
+          permission-contents: read
+
+      - name: Check out the release tooling
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          token: ${{ steps.source.outputs.token }}
+          ref: ${{ inputs.source_ref }}
+          persist-credentials: false
+          sparse-checkout: |
+            unrest-launcher
+            packages
+            agentloop/scripts
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.10
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: '22'
+
+      - name: Install the release tooling
+        working-directory: unrest-launcher
+        run: |
+          bun install --frozen-lockfile --ignore-scripts
+          npm ci --prefix scripts/tauri-toolchain --ignore-scripts --no-audit --no-fund
+
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: gamegen-*
+          path: ${{ runner.temp }}/gamegen
+          merge-multiple: true
+
+      # The only step that holds the product key. The signer prints key
+      # material, so its output is discarded.
+      - name: Sign the GameGen archives
+        working-directory: unrest-launcher
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.UNREST_PRODUCT_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.UNREST_PRODUCT_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for archive in "$RUNNER_TEMP"/gamegen/*.tar.gz; do
+            node scripts/tauri-toolchain/node_modules/@tauri-apps/cli/tauri.js signer sign "$archive" >/dev/null 2>&1 \
+              || { echo "::error::could not sign $(basename "$archive")"; exit 1; }
+            test -s "$archive.sig"
+          done
+
+      # Each entry is built from the package's own receipt and its exact bytes.
+      - name: Build the product list
+        working-directory: unrest-launcher
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/gamegen"
+          echo '[]' > "$RUNNER_TEMP/input.json"
+          for receipt in "$dir"/gamegen-package-*.json; do
+            name=$(jq -r '.archive | split("/") | last | split("\\") | last' "$receipt")
+            jq --arg archive "$dir/$name" '.archive = $archive' "$receipt" > "$receipt.local"
+            jq --arg receipt "$receipt.local" --arg sig "$dir/$name.sig" \
+               --arg url "https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/$name" \
+               '. + [{receipt: $receipt, signatureFile: $sig, url: $url, generationRelativeResourcesVerified: true}]' \
+               "$RUNNER_TEMP/input.json" > "$RUNNER_TEMP/input.next" && mv "$RUNNER_TEMP/input.next" "$RUNNER_TEMP/input.json"
+          done
+          bun scripts/release/create-gamegen-test-catalog.ts "$RUNNER_TEMP/input.json" "$RUNNER_TEMP/products-v1.json"
+          bun scripts/release/validate-product-catalog.ts "$RUNNER_TEMP/products-v1.json"
+          mkdir "$RUNNER_TEMP/catalog"
+          cp "$RUNNER_TEMP/products-v1.json" "$dir"/*.sig "$RUNNER_TEMP/catalog/"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: catalog
+          path: ${{ runner.temp }}/catalog/
+          if-no-files-found: error
+          retention-days: 14
+
   launcher:
-    needs: validate
+    # Runs after the product list when there is one, and without it otherwise.
+    needs: [validate, catalog]
+    if: ${{ always() && needs.validate.result == 'success' && (needs.catalog.result == 'success' || needs.catalog.result == 'skipped') }}
     name: Launcher ${{ matrix.target }}
     strategy:
       fail-fast: false
@@ -239,28 +344,57 @@ jobs:
           bun run build:beta:web
           bun run build:beta:icons
 
-      - name: Package the launcher (unsigned)
-        run: bun scripts/package-beta.ts --target=${{ matrix.target }}
+      - name: Fetch the product list
+        if: ${{ needs.catalog.result == 'success' }}
+        uses: actions/download-artifact@v5
+        with:
+          name: catalog
+          path: ${{ runner.temp }}/catalog
 
-      # macOS: the zipped app. Windows: the NSIS installer.
+      - name: Compile the product list into the launcher
+        if: ${{ needs.catalog.result == 'success' }}
+        run: cp "$RUNNER_TEMP/catalog/products-v1.json" src/products/unrest/native/products-v1.json
+
+      # Only PUBLIC keys reach the build. `--updater` turns on self-update.
+      - name: Package the launcher
+        env:
+          UNREST_UPDATER_PUBLIC_KEY: ${{ vars.UNREST_UPDATER_PUBLIC_KEY }}
+          UNREST_PRODUCT_PUBLIC_KEY: ${{ needs.catalog.result == 'success' && vars.UNREST_PRODUCT_PUBLIC_KEY || '' }}
+        run: |
+          if [[ -n "$UNREST_UPDATER_PUBLIC_KEY" ]]; then
+            bun scripts/package-beta.ts --target=${{ matrix.target }} --updater
+          else
+            unset UNREST_UPDATER_PUBLIC_KEY
+            bun scripts/package-beta.ts --target=${{ matrix.target }}
+          fi
+
+      # macOS: the zipped app, plus its update archive when updates are on.
+      # Windows: the NSIS installer, which is also the update archive.
       - name: Keep the package
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: launcher-${{ matrix.target }}
           path: |
             ${{ runner.temp }}/launcher-target/${{ matrix.target }}/release/bundle/macos/*.zip
+            ${{ runner.temp }}/launcher-target/${{ matrix.target }}/release/bundle/macos/*.app.tar.gz
             ${{ runner.temp }}/launcher-target/${{ matrix.target }}/release/bundle/nsis/*.exe
           if-no-files-found: error
           retention-days: 14
 
   draft-release:
     name: Draft release
-    needs: [gamegen, launcher]
-    if: ${{ inputs.tag != '' }}
+    needs: [gamegen, launcher, catalog]
+    if: ${{ always() && inputs.tag != '' && needs.gamegen.result == 'success' && needs.launcher.result == 'success' && (needs.catalog.result == 'success' || needs.catalog.result == 'skipped') }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     permissions:
       contents: write
+    defaults:
+      run:
+        shell: bash
+    env:
+      TAG: ${{ inputs.tag }}
+      SIGN_UPDATES: ${{ vars.UNREST_UPDATER_PUBLIC_KEY != '' && 'yes' || '' }}
     steps:
       - name: Collect the packages
         uses: actions/download-artifact@v5
@@ -268,13 +402,83 @@ jobs:
           path: packages
           merge-multiple: true
 
+      - name: Mint a read-only token for the source
+        if: ${{ env.SIGN_UPDATES == 'yes' }}
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        id: source
+        with:
+          app-id: ${{ vars.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+          owner: trygentic
+          repositories: unrest
+          permission-contents: read
+
+      - name: Check out the release tooling
+        if: ${{ env.SIGN_UPDATES == 'yes' }}
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          token: ${{ steps.source.outputs.token }}
+          ref: ${{ inputs.source_ref }}
+          path: source
+          persist-credentials: false
+          sparse-checkout: |
+            unrest-launcher
+            packages
+            agentloop/scripts
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        if: ${{ env.SIGN_UPDATES == 'yes' }}
+        with:
+          bun-version: 1.3.10
+
+      - name: Install the release tooling
+        if: ${{ env.SIGN_UPDATES == 'yes' }}
+        working-directory: source/unrest-launcher
+        run: |
+          bun install --frozen-lockfile --ignore-scripts
+          npm ci --prefix scripts/tauri-toolchain --ignore-scripts --no-audit --no-fund
+
+      # The only step that holds the launcher's update key. Each signature
+      # names the version, so an old archive cannot be relabelled as a new one.
+      - name: Sign the launcher's update archives
+        if: ${{ env.SIGN_UPDATES == 'yes' }}
+        working-directory: source/unrest-launcher
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.UNREST_UPDATER_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.UNREST_UPDATER_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          version=$(jq -r .version package.json)
+          for archive in "$GITHUB_WORKSPACE"/packages/Unrest.app.tar.gz "$GITHUB_WORKSPACE"/packages/*-setup.exe; do
+            test -f "$archive"
+            node scripts/tauri-toolchain/node_modules/@tauri-apps/cli/tauri.js signer sign --app-version "$version" "$archive" >/dev/null 2>&1 \
+              || { echo "::error::could not sign $(basename "$archive")"; exit 1; }
+            test -s "$archive.sig"
+          done
+
+      # `latest.json` is what an installed launcher reads to find its update.
+      # It ships inside this draft; moving it to the live `beta` channel is a
+      # separate, deliberate step after the smoke test.
+      - name: Write the launcher update manifest
+        if: ${{ env.SIGN_UPDATES == 'yes' }}
+        working-directory: source/unrest-launcher
+        run: |
+          set -euo pipefail
+          p="$GITHUB_WORKSPACE/packages"
+          base="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG"
+          exe=$(basename "$p"/*-setup.exe)
+          jq -n --arg p "$p" --arg base "$base" --arg exe "$exe" '[
+            {platform: "darwin-aarch64", artifact: ($p + "/Unrest.app.tar.gz"), signatureFile: ($p + "/Unrest.app.tar.gz.sig"), url: ($base + "/Unrest.app.tar.gz")},
+            {platform: "windows-x86_64", artifact: ($p + "/" + $exe), signatureFile: ($p + "/" + $exe + ".sig"), url: ($base + "/" + $exe)}
+          ]' > "$RUNNER_TEMP/artifacts.json"
+          bun scripts/release/create-launcher-manifest.ts "$RUNNER_TEMP/artifacts.json" "$(jq -r .version package.json)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$p/latest.json"
+
       # A draft is visible only to people with write access to this repository.
       # Marking it public is a manual step after the smoke test.
       - name: Create the draft release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.tag }}
-          REF: ${{ inputs.source_ref }}
         run: |
           set -euo pipefail
           cd packages
@@ -285,4 +489,4 @@ jobs:
             --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
             --draft --prerelease \
             --title "Unrest ${TAG#v}" \
-            --notes "Unsigned beta build. macOS: right-click the app and choose Open the first time. Check downloads against SHA256SUMS before running them."
+            --notes "Beta build, not yet signed by Apple or Microsoft. macOS: right-click the app and choose Open the first time. Check downloads against SHA256SUMS before running them."
