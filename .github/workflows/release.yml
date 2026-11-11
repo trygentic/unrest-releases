@@ -121,7 +121,9 @@ jobs:
         run: |
           echo "CARGO_HOME=$(cygpath -w "$RUNNER_TEMP/cargo-home")" >> "$GITHUB_ENV"
           echo "LIBCLANG_PATH=C:\\Program Files\\LLVM\\bin" >> "$GITHUB_ENV"
-          crt=$(ls -d "/c/Program Files/Microsoft Visual Studio/2022/"*/VC/Redist/MSVC/*/x64/Microsoft.VC143.CRT | sort | tail -1)
+          vs=$("/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe" -latest -products '*' -property installationPath)
+          crt=$(ls -d "$(cygpath -u "$vs")"/VC/Redist/MSVC/*/x64/Microsoft.VC*.CRT | sort | tail -1)
+          echo "CRT folder: $crt"
           test -d "$crt"
           echo "AGENTLOOP_WINDOWS_CRT_DIR=$(cygpath -w "$crt")" >> "$GITHUB_ENV"
 
@@ -207,7 +209,10 @@ jobs:
           token: ${{ steps.source.outputs.token }}
           ref: ${{ inputs.source_ref }}
           persist-credentials: false
-          sparse-checkout: unrest-launcher
+          # `packages` holds the shared UI packages the launcher depends on.
+          sparse-checkout: |
+            unrest-launcher
+            packages
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
