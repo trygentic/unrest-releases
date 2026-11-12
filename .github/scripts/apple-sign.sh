@@ -53,8 +53,12 @@ import_cert() {
   local identity
   identity=$(security find-identity -v -p codesigning "$keychain" | awk '/"Developer ID Application: /{print $2; exit}')
   if [[ -z "$identity" ]]; then
-    echo "Code signing identities found in MAC_CERT_P12:"
-    security find-identity -v -p codesigning "$keychain" | sed 's/^ *[0-9]*) [0-9A-F]* /  /'
+    # Without -v the list also shows certificates macOS will not sign with.
+    echo "Code signing identities in MAC_CERT_P12 (valid or not):"
+    security find-identity -p codesigning "$keychain" | sed 's/^ *[0-9]*) [0-9A-F]* /  /'
+    if security find-identity -p codesigning "$keychain" | grep -q '"Developer ID Application: '; then
+      die "MAC_CERT_P12 holds a \"Developer ID Application\" certificate, but macOS does not accept it for signing: it is expired or revoked, or Apple's Developer ID intermediate certificate is missing on this machine."
+    fi
     die "MAC_CERT_P12 holds no \"Developer ID Application\" certificate with its private key. Export that certificate and its key together from Keychain Access."
   fi
   echo "Signing as: $(security find-identity -v -p codesigning "$keychain" | awk -F'"' '/"Developer ID Application: /{print $2; exit}')"
