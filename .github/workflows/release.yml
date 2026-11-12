@@ -35,7 +35,9 @@ name: release
 # a hash or signature of exact bytes. So each app is Apple-signed first and
 # only then archived, hashed and signed for the launcher:
 #
-#   gamegen           build GameGen (or gamegen-prebuilt: fetch it)
+#   apple-preflight   try the certificate and the notarization key (a minute,
+#                     alongside the build, so bad settings stop the run early)
+#   gamegen           build GameGen (or gamegen-prebuilt / gamegen-reuse: fetch it)
 #   gamegen-apple     Apple-sign GameGen.app, notarize, staple, re-archive
 #   catalog           hash and sign the FINAL GameGen archives; write the product list
 #   launcher          compile that list in; build; Apple-sign Unrest.app,
@@ -59,6 +61,10 @@ on:
         type: string
       gamegen_run_id:
         description: 'Optional. Run ID of a successful "Release (self-hosted)" run on main in trygentic/unrest. GameGen is then taken from that run instead of being built here; the launcher is still built, and everything is signed, here.'
+        required: false
+        type: string
+      reuse_gamegen_from_run:
+        description: 'Optional. Run ID of an earlier run of THIS workflow. GameGen is not built again: its packages are taken from that run. They must have been built from the same commit as source_ref and hold the same GameGen version. For retrying signing after a failure.'
         required: false
         type: string
       platforms:
@@ -97,6 +103,7 @@ jobs:
     timeout-minutes: 10
     outputs:
       apple: ${{ steps.apple.outputs.apple }}
+      source_sha: ${{ steps.sha.outputs.sha }}
       launcher_version: ${{ steps.check.outputs.launcher_version }}
       gamegen_version: ${{ steps.check.outputs.gamegen_version }}
     steps:
@@ -107,8 +114,15 @@ jobs:
           REF: ${{ inputs.source_ref }}
           TAG: ${{ inputs.tag }}
           RUN: ${{ inputs.gamegen_run_id }}
+          REUSE: ${{ inputs.reuse_gamegen_from_run }}
           PLATFORMS: ${{ inputs.platforms }}
         run: |
+          if [[ -n "$REUSE" && ! "$REUSE" =~ ^[0-9]+$ ]]; then
+            echo "::error::reuse_gamegen_from_run must be a number"; exit 1
+          fi
+          if [[ -n "$REUSE" && -n "$RUN" ]]; then
+            echo "::error::give gamegen_run_id or reuse_gamegen_from_run, not both"; exit 1
+          fi
           if [[ "$REF" != "main" && ! "$REF" =~ ^v[0-9] && ! "$REF" =~ ^[0-9a-f]{7,40}$ ]]; then
             echo "::error::source_ref must be main, a v* tag or a commit SHA"; exit 1
           fi
@@ -193,6 +207,11 @@ jobs:
             unrest-launcher/src/products/unrest/native
             agentloop/src/products/gamegen
 
+      # The exact commit, for checking reused GameGen packages against it.
+      - name: Note the commit
+        id: sha
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
       # The rules live in the source, with tests: unrest-launcher/scripts/release/check-release.mjs.
       #   - the tag is v<launcher version> (v0.0.N-test.N is a throwaway trial)
       #   - this GameGen version is not already in a published release
@@ -222,7 +241,7 @@ jobs:
 
   gamegen:
     needs: validate
-    if: ${{ inputs.gamegen_run_id == '' }}
+    if: ${{ inputs.gamegen_run_id == '' && inputs.reuse_gamegen_from_run == '' }}
     name: GameGen ${{ matrix.target }}
     strategy:
       fail-fast: false
@@ -403,14 +422,120 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # Takes GameGen from an earlier run of this workflow instead of building it
+  # again (input `reuse_gamegen_from_run`). For retrying after a signing
+  # failure: the build takes an hour, signing takes minutes. The packages must
+  # come from this workflow, and their receipts must name the commit and the
+  # GameGen version this run is releasing.
+  gamegen-reuse:
+    name: GameGen from an earlier run
+    needs: validate
+    if: ${{ inputs.reuse_gamegen_from_run != '' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: read
+    env:
+      RUN_ID: ${{ inputs.reuse_gamegen_from_run }}
+      PLATFORMS: ${{ inputs.platforms }}
+      SOURCE_SHA: ${{ needs.validate.outputs.source_sha }}
+      GAMEGEN_VERSION: ${{ needs.validate.outputs.gamegen_version }}
+    steps:
+      - name: Download and check the packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          path=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" --jq .path)
+          if [[ "$path" != ".github/workflows/release.yml" ]]; then
+            echo "::error::run $RUN_ID is not a run of this release workflow"; exit 1
+          fi
+          targets=(aarch64-apple-darwin)
+          if [[ "$PLATFORMS" != "macos" ]]; then targets+=(x86_64-pc-windows-msvc); fi
+          for target in "${targets[@]}"; do
+            dir="$RUNNER_TEMP/gamegen/gamegen-$target"
+            gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --name "gamegen-$target" --dir "$dir" \
+              || { echo "::error::run $RUN_ID has no gamegen-$target package (artifacts are kept for 14 days)"; exit 1; }
+            receipt="$dir/gamegen-package-$target.json"
+            if [[ ! -f "$receipt" ]]; then echo "::error::no receipt in gamegen-$target"; ls -l "$dir"; exit 1; fi
+            commit=$(jq -r .sourceCommit "$receipt"); version=$(jq -r .version "$receipt"); dirty=$(jq -r .sourceDirty "$receipt")
+            echo "gamegen-$target: GameGen $version, built from $commit"
+            if [[ "$commit" != "$SOURCE_SHA" ]]; then
+              echo "::error::gamegen-$target in run $RUN_ID was built from $commit, but source_ref is $SOURCE_SHA. Give source_ref=$commit to reuse it, or build again."; exit 1
+            fi
+            if [[ "$version" != "$GAMEGEN_VERSION" || "$dirty" != "false" ]]; then
+              echo "::error::gamegen-$target in run $RUN_ID is GameGen $version (expected $GAMEGEN_VERSION), or was built from changed source"; exit 1
+            fi
+            archive="$dir/$(jq -r .installLayout.root "$receipt").tar.gz"
+            if [[ ! -f "$archive" ]]; then echo "::error::the receipt's archive is missing from gamegen-$target"; ls -l "$dir"; exit 1; fi
+            # The receipt's hash is of the archive as that run left it.
+            echo "$(jq -r .sha256 "$receipt")  $archive" | sha256sum -c - >/dev/null \
+              || { echo "::error::the archive in gamegen-$target does not match its receipt"; exit 1; }
+          done
+          ls -lR "$RUNNER_TEMP/gamegen"
+
+      # Passed on under the names the later jobs already expect.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: gamegen-aarch64-apple-darwin
+          path: ${{ runner.temp }}/gamegen/gamegen-aarch64-apple-darwin/
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: ${{ inputs.platforms != 'macos' }}
+        with:
+          name: gamegen-x86_64-pc-windows-msvc
+          path: ${{ runner.temp }}/gamegen/gamegen-x86_64-pc-windows-msvc/
+          if-no-files-found: error
+          retention-days: 14
+
+  # Tries the Apple settings at the very start, in parallel with the GameGen
+  # build, so a wrong certificate, password or notarization key stops the run
+  # in a minute instead of after the build. It imports the certificate exactly
+  # as the signing jobs do, and asks Apple a read-only question with the
+  # notarization key. Nothing is signed or uploaded.
+  apple-preflight:
+    name: Check the Apple settings
+    needs: validate
+    if: ${{ needs.validate.outputs.apple == 'yes' }}
+    runs-on: macos-15
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out the signing script
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
+      - name: Import the Developer ID certificate
+        env:
+          MAC_CERT_P12: ${{ secrets.MAC_CERT_P12 }}
+          MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
+        run: bash .github/scripts/apple-sign.sh import-cert
+
+      - name: Ask Apple whether the notarization key works
+        env:
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: bash .github/scripts/apple-sign.sh check-notary
+
+      - name: Delete the keychain
+        if: ${{ always() }}
+        run: bash .github/scripts/apple-sign.sh cleanup
+
   # Apple-signs GameGen for macOS. It runs here, on GitHub's Mac, even when
   # GameGen was built on our own machines: the certificate never leaves this
   # repository's secrets. The signed package REPLACES the unsigned one under
   # the same artifact name, so every later job sees only the final bytes.
   gamegen-apple:
     name: Apple-sign GameGen
-    needs: [validate, gamegen, gamegen-prebuilt]
-    if: ${{ always() && needs.validate.outputs.apple == 'yes' && (needs.gamegen.result == 'success' || needs.gamegen-prebuilt.result == 'success') }}
+    needs: [validate, apple-preflight, gamegen, gamegen-prebuilt, gamegen-reuse]
+    if: ${{ always() && needs.validate.outputs.apple == 'yes' && needs.apple-preflight.result == 'success' && (needs.gamegen.result == 'success' || needs.gamegen-prebuilt.result == 'success' || needs.gamegen-reuse.result == 'success') }}
     runs-on: macos-15
     timeout-minutes: 90
     defaults:
@@ -521,9 +646,9 @@ jobs:
     name: Sign GameGen and list it for the launcher
     # After gamegen-apple: these hashes and signatures must be of the archives
     # as they ship. If Apple signing was wanted and failed, this does not run.
-    needs: [gamegen, gamegen-prebuilt, gamegen-apple]
+    needs: [apple-preflight, gamegen, gamegen-prebuilt, gamegen-reuse, gamegen-apple]
     # Signed product lists only make sense for a real, tagged release.
-    if: ${{ always() && inputs.tag != '' && vars.UNREST_PRODUCT_PUBLIC_KEY != '' && (needs.gamegen.result == 'success' || needs.gamegen-prebuilt.result == 'success') && (needs.gamegen-apple.result == 'success' || needs.gamegen-apple.result == 'skipped') }}
+    if: ${{ always() && inputs.tag != '' && vars.UNREST_PRODUCT_PUBLIC_KEY != '' && (needs.gamegen.result == 'success' || needs.gamegen-prebuilt.result == 'success' || needs.gamegen-reuse.result == 'success') && (needs.gamegen-apple.result == 'success' || needs.gamegen-apple.result == 'skipped') && (needs.apple-preflight.result == 'success' || needs.apple-preflight.result == 'skipped') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     defaults:
@@ -617,8 +742,8 @@ jobs:
 
   launcher:
     # Runs after the product list when there is one, and without it otherwise.
-    needs: [validate, catalog, gamegen-prebuilt, gamegen-apple]
-    if: ${{ always() && needs.validate.result == 'success' && (needs.catalog.result == 'success' || needs.catalog.result == 'skipped') && needs.gamegen-prebuilt.result != 'failure' && (needs.gamegen-apple.result == 'success' || needs.gamegen-apple.result == 'skipped') }}
+    needs: [validate, apple-preflight, catalog, gamegen-prebuilt, gamegen-reuse, gamegen-apple]
+    if: ${{ always() && needs.validate.result == 'success' && (needs.catalog.result == 'success' || needs.catalog.result == 'skipped') && needs.gamegen-prebuilt.result != 'failure' && needs.gamegen-reuse.result != 'failure' && (needs.gamegen-apple.result == 'success' || needs.gamegen-apple.result == 'skipped') && (needs.apple-preflight.result == 'success' || needs.apple-preflight.result == 'skipped') }}
     name: Launcher ${{ matrix.target }}
     strategy:
       fail-fast: false
@@ -812,9 +937,9 @@ jobs:
 
   draft-release:
     name: Draft release
-    needs: [validate, gamegen, gamegen-prebuilt, gamegen-apple, launcher, catalog]
+    needs: [validate, apple-preflight, gamegen, gamegen-prebuilt, gamegen-reuse, gamegen-apple, launcher, catalog]
     # A failed Apple signing stops the release: nothing ships unsigned by accident.
-    if: ${{ always() && inputs.tag != '' && (needs.gamegen.result == 'success' || needs.gamegen-prebuilt.result == 'success') && (needs.gamegen-apple.result == 'success' || needs.gamegen-apple.result == 'skipped') && needs.launcher.result == 'success' && (needs.catalog.result == 'success' || needs.catalog.result == 'skipped') }}
+    if: ${{ always() && inputs.tag != '' && (needs.gamegen.result == 'success' || needs.gamegen-prebuilt.result == 'success' || needs.gamegen-reuse.result == 'success') && (needs.gamegen-apple.result == 'success' || needs.gamegen-apple.result == 'skipped') && needs.launcher.result == 'success' && (needs.catalog.result == 'success' || needs.catalog.result == 'skipped') && (needs.apple-preflight.result == 'success' || needs.apple-preflight.result == 'skipped') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -988,13 +1113,13 @@ jobs:
           if [[ "$PLATFORMS" == "macos" ]]; then
             platforms="For macOS (Apple Silicon). A Windows version is coming; this release has no Windows downloads."
             if [[ "$APPLE" == "yes" ]]; then signing="The apps are signed and notarized by Apple."
-            else signing="Not yet signed by Apple: right-click the app and choose Open the first time."; fi
+            else signing="NOT signed by Apple: macOS will warn on first open. Right-click the app and choose Open; on macOS 15 or later, try to open it once, then allow it under System Settings > Privacy & Security > Open Anyway."; fi
           else
             platforms="For macOS (Apple Silicon) and Windows (x64)."
             if [[ "$APPLE" == "yes" ]]; then
               signing="The macOS apps are signed and notarized by Apple. The Windows apps are not signed by Microsoft yet: SmartScreen will warn; choose More info, then Run anyway."
             else
-              signing="Not yet signed by Apple or Microsoft. macOS: right-click the app and choose Open the first time. Windows: SmartScreen will warn; choose More info, then Run anyway."
+              signing="NOT signed by Apple: macOS will warn on first open. Right-click the app and choose Open; on macOS 15 or later, try to open it once, then allow it under System Settings > Privacy & Security > Open Anyway. The Windows apps are not signed by Microsoft either: SmartScreen will warn; choose More info, then Run anyway."
             fi
           fi
           gh release create "$TAG" * \
