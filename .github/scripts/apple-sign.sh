@@ -25,13 +25,15 @@ set -euo pipefail
 work="${RUNNER_TEMP:-${TMPDIR:-/tmp}}"
 keychain="${APPLE_KEYCHAIN:-$work/unrest-signing.keychain-db}"
 api_key_file="$work/unrest-notary-key.p8"
+p12="$work/unrest-cert.p12"
+# Secrets written to disk are removed however the script ends.
+trap 'rm -f "$api_key_file" "$p12"' EXIT
 
 die() { echo "::error::$*"; exit 1; }
 
 import_cert() {
   [[ -n "${MAC_CERT_P12:-}" && -n "${MAC_CERT_PASSWORD:-}" ]] || die "MAC_CERT_P12 and MAC_CERT_PASSWORD are required"
-  local p12="$work/unrest-cert.p12" password
-  trap 'rm -f "$p12"' EXIT
+  local password
   printf '%s' "$MAC_CERT_P12" | base64 -D > "$p12" 2>/dev/null \
     || die "MAC_CERT_P12 is not base64. Store the output of: base64 -i certificate.p12"
   password=$(openssl rand -hex 24)
@@ -148,7 +150,6 @@ notarize_app() {
   local zip result id status
   zip="$work/notarize-$(basename "$app" .app).zip"
   result="$work/notarize-$(basename "$app" .app).json"
-  trap 'rm -f "$api_key_file" "$zip"' EXIT
   ( umask 077
     if [[ "$APPLE_API_KEY_P8" == *"BEGIN PRIVATE KEY"* ]]; then printf '%s\n' "$APPLE_API_KEY_P8" > "$api_key_file"
     else printf '%s' "$APPLE_API_KEY_P8" | base64 -D > "$api_key_file" 2>/dev/null || die "APPLE_API_KEY_P8 is neither the .p8 text nor its base64"; fi )
@@ -173,6 +174,7 @@ notarize_app() {
     fi
     die "Apple did not notarize $(basename "$app") (${status:-no answer}). Nothing unsigned is released; fix the cause and run again."
   fi
+  rm -f "$zip"
   # Staple, so the app opens on a Mac that is offline the first time.
   xcrun stapler staple "$app"
 }
@@ -194,7 +196,7 @@ verify_app() {
 }
 
 cleanup() {
-  rm -f "$api_key_file" "$work/unrest-cert.p12"
+  rm -f "$api_key_file" "$p12"
   if [[ -f "$work/unrest-keychains-before.txt" ]]; then
     # shellcheck disable=SC2046
     security list-keychains -d user -s $(cat "$work/unrest-keychains-before.txt") || true
