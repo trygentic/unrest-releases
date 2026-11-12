@@ -813,6 +813,45 @@ jobs:
           path: packages
           merge-multiple: true
 
+      # The launcher packages arrive in subfolders (macos/, nsis/): an artifact
+      # made from several paths keeps the folders below their common parent.
+      # Every later step, and the release itself, wants one flat folder. Move
+      # everything up, refuse two files with one name, then check that every
+      # file a release needs is there, by name, before anything is signed.
+      - name: Lay the packages out flat and check them
+        run: |
+          set -euo pipefail
+          cd packages
+          find . -mindepth 2 -type f -print0 | while IFS= read -r -d '' file; do
+            name=$(basename "$file")
+            if [[ -e "$name" ]]; then echo "::error::two packages are both named $name ($file)"; exit 1; fi
+            mv "$file" "$name"
+          done
+          find . -mindepth 1 -type d -empty -delete
+          missing=0
+          need() { # description, then a glob that must match exactly one file
+            local what="$1" pattern="$2" found
+            found=$(find . -maxdepth 1 -type f -name "$pattern" | wc -l | tr -d ' ')
+            if [[ "$found" != "1" ]]; then
+              echo "::error::expected exactly one $what ($pattern) in the packages, found $found"; missing=1
+            fi
+          }
+          need "macOS launcher ZIP" 'Unrest_*-inspection.zip'
+          need "Windows launcher installer" 'Unrest_*-setup.exe'
+          if [[ "$SIGN_UPDATES" == "yes" ]]; then need "macOS launcher update archive" 'Unrest.app.tar.gz'; fi
+          need "macOS GameGen receipt" 'gamegen-package-*-apple-darwin.json'
+          need "Windows GameGen receipt" 'gamegen-package-*-windows-msvc.json'
+          # Each receipt names its archive; a product list implies its signature too.
+          for receipt in gamegen-package-*.json; do
+            [[ -f "$receipt" ]] || continue
+            archive="$(jq -r .installLayout.root "$receipt").tar.gz"
+            if [[ ! -f "$archive" ]]; then echo "::error::$receipt describes $archive, which is not in the packages"; missing=1; fi
+            if [[ -f products-v1.json && ! -f "$archive.sig" ]]; then echo "::error::the product list is here but $archive.sig is not"; missing=1; fi
+          done
+          echo "The packages:"
+          ls -l
+          if [[ "$missing" != "0" ]]; then echo "::error::the packages are incomplete; see the messages above and the listing"; exit 1; fi
+
       - name: Mint a read-only token for the source
         if: ${{ env.SIGN_UPDATES == 'yes' }}
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
@@ -862,10 +901,14 @@ jobs:
           set -euo pipefail
           version=$(jq -r .version package.json)
           for archive in "$GITHUB_WORKSPACE"/packages/Unrest.app.tar.gz "$GITHUB_WORKSPACE"/packages/*-setup.exe; do
-            test -f "$archive"
+            if [[ ! -f "$archive" ]]; then
+              echo "::error::update archive not found: $archive"; ls -l "$GITHUB_WORKSPACE/packages"; exit 1
+            fi
             node scripts/tauri-toolchain/node_modules/@tauri-apps/cli/tauri.js signer sign --app-version "$version" "$archive" >/dev/null 2>&1 \
               || { echo "::error::could not sign $(basename "$archive")"; exit 1; }
-            test -s "$archive.sig"
+            if [[ ! -s "$archive.sig" ]]; then
+              echo "::error::the signer wrote no $(basename "$archive").sig"; ls -l "$GITHUB_WORKSPACE/packages"; exit 1
+            fi
           done
 
       # `latest.json` is what an installed launcher reads to find its update.
