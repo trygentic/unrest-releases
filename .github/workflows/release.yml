@@ -13,14 +13,37 @@ name: release
 # secrets, and compiler warnings are capped so private source is not quoted,
 # but a failing build can still show file names and error lines.
 #
-# The apps are not signed by Apple or Microsoft yet. Update signing is separate
-# and switches on by itself once these exist in this repository's settings:
-#   variables  UNREST_UPDATER_PUBLIC_KEY, UNREST_PRODUCT_PUBLIC_KEY
-#   secrets    UNREST_UPDATER_PRIVATE_KEY, UNREST_PRODUCT_PRIVATE_KEY
-#              (and the matching *_PASSWORD secrets if the keys have one)
-# With them, a tagged run signs the GameGen archives, compiles the list of those
-# archives into the launcher, and signs the launcher's own update archives.
-# Private keys are only ever present in the two signing steps, never in a build.
+# There are two separate kinds of signing. Each switches on by itself once its
+# settings exist in this repository, and a run without them behaves as before.
+#
+# 1. Apple signing and notarization of the two macOS apps, so they open without
+#    a Gatekeeper warning. Needs all five secrets:
+#      MAC_CERT_P12, MAC_CERT_PASSWORD                         the Developer ID certificate
+#      APPLE_API_KEY_P8, APPLE_API_KEY_ID, APPLE_API_ISSUER    the notarization key
+#    The steps are in .github/scripts/apple-sign.sh. If Apple rejects an app the
+#    job fails and prints Apple's log; nothing unsigned is released in its place.
+#    Windows apps are not signed by Microsoft yet (see the placeholder below).
+#
+# 2. Our own update signing, which is what an installed launcher checks:
+#      variables  UNREST_UPDATER_PUBLIC_KEY, UNREST_PRODUCT_PUBLIC_KEY
+#      secrets    UNREST_UPDATER_PRIVATE_KEY, UNREST_PRODUCT_PRIVATE_KEY
+#                 (and the matching *_PASSWORD secrets if the keys have one)
+#    With them, a tagged run signs the GameGen archives, compiles the list of
+#    those archives into the launcher, and signs the launcher's update archives.
+#
+# ORDER MATTERS. Apple signing changes an app's bytes, and everything in (2) is
+# a hash or signature of exact bytes. So each app is Apple-signed first and
+# only then archived, hashed and signed for the launcher:
+#
+#   gamegen           build GameGen (or gamegen-prebuilt: fetch it)
+#   gamegen-apple     Apple-sign GameGen.app, notarize, staple, re-archive
+#   catalog           hash and sign the FINAL GameGen archives; write the product list
+#   launcher          compile that list in; build; Apple-sign Unrest.app,
+#                     notarize, staple; only then make the ZIP and update archive
+#   draft-release     sign the FINAL launcher update archives; latest.json; draft
+#
+# No private key is ever present in a build step. The Apple certificate lives in
+# a temporary keychain that an always-run step deletes.
 
 on:
   workflow_dispatch:
@@ -31,13 +54,18 @@ on:
         type: string
         default: 'main'
       tag:
-        description: 'Release tag to create as a draft (e.g. v0.25.0-beta.1). Leave empty to build without creating a release.'
+        description: 'Release tag to create as a draft. Must be v<launcher version at source_ref> (e.g. v0.1.0); v0.0.N-test.N for a throwaway trial. Leave empty to build without creating a release.'
         required: false
         type: string
       gamegen_run_id:
         description: 'Optional. Run ID of a successful "Release (self-hosted)" run on main in trygentic/unrest. GameGen is then taken from that run instead of being built here; the launcher is still built, and everything is signed, here.'
         required: false
         type: string
+      skip_apple_signing:
+        description: 'Ship the macOS apps WITHOUT Apple signing even though the Apple settings exist. Only for a deliberate unsigned build; users will see a Gatekeeper warning.'
+        required: false
+        type: boolean
+        default: false
 
 # The source checkout uses a token minted from the release bot GitHub App.
 # GITHUB_TOKEN is read-only everywhere except the one job that drafts a release.
@@ -58,7 +86,11 @@ env:
 jobs:
   validate:
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 10
+    outputs:
+      apple: ${{ steps.apple.outputs.apple }}
+      launcher_version: ${{ steps.check.outputs.launcher_version }}
+      gamegen_version: ${{ steps.check.outputs.gamegen_version }}
     steps:
       # An arbitrary branch would run its build scripts with the source token
       # in scope, so only main, release tags and exact commits are accepted.
@@ -77,6 +109,95 @@ jobs:
           if [[ -n "$RUN" && ! "$RUN" =~ ^[0-9]+$ ]]; then
             echo "::error::gamegen_run_id must be a number"; exit 1
           fi
+
+      # Apple signing needs all five settings. None: the apps ship unsigned, as
+      # before. Some but not all: stop now rather than find out after the build.
+      # Only "is it set" reaches this step, never a value.
+      - name: See whether Apple signing is configured
+        id: apple
+        env:
+          SKIP: ${{ inputs.skip_apple_signing }}
+          HAS_MAC_CERT_P12: ${{ secrets.MAC_CERT_P12 != '' }}
+          HAS_MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD != '' }}
+          HAS_APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 != '' }}
+          HAS_APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID != '' }}
+          HAS_APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER != '' }}
+        run: |
+          missing=(); present=0
+          for name in MAC_CERT_P12 MAC_CERT_PASSWORD APPLE_API_KEY_P8 APPLE_API_KEY_ID APPLE_API_ISSUER; do
+            has="HAS_$name"
+            if [[ "${!has}" == "true" ]]; then present=$((present + 1)); else missing+=("$name"); fi
+          done
+          if [[ "$SKIP" == "true" ]]; then
+            echo "::warning::skip_apple_signing is set: the macOS apps will NOT be signed by Apple."
+          elif [[ $present -eq 5 ]]; then
+            echo "apple=yes" >> "$GITHUB_OUTPUT"
+            echo "Apple signing and notarization: on."
+          elif [[ $present -eq 0 ]]; then
+            echo "Apple signing is not configured: the macOS apps will not be signed by Apple."
+          else
+            echo "::error::Apple signing is half configured. Missing secrets: ${missing[*]}. Add them, or remove all five."; exit 1
+          fi
+
+      - name: Mint a read-only token for the source
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        id: source
+        with:
+          app-id: ${{ vars.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+          owner: trygentic
+          repositories: unrest
+          permission-actions: read
+          permission-contents: read
+
+      # The versions are read from the commit that will be built: the
+      # self-hosted run's commit when GameGen comes from there.
+      - name: Find the commit to check
+        id: ref
+        env:
+          GH_TOKEN: ${{ steps.source.outputs.token }}
+          REF: ${{ inputs.source_ref }}
+          RUN: ${{ inputs.gamegen_run_id }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$RUN" ]]; then
+            echo "ref=$(gh api "repos/$SOURCE_REPO/actions/runs/$RUN" --jq .head_sha)" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check out the version files and the release check
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          token: ${{ steps.source.outputs.token }}
+          ref: ${{ steps.ref.outputs.ref }}
+          persist-credentials: false
+          sparse-checkout: |
+            unrest-launcher/scripts/release
+            unrest-launcher/src/products/unrest/native
+            agentloop/src/products/gamegen
+
+      # The rules live in the source, with tests: unrest-launcher/scripts/release/check-release.mjs.
+      #   - the tag is v<launcher version> (v0.0.N-test.N is a throwaway trial)
+      #   - this GameGen version is not already in a published release
+      #   - no published release has this tag
+      # Published releases are enough for these checks, so a read-only token will do.
+      - name: Check the tag and the versions
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          script=unrest-launcher/scripts/release/check-release.mjs
+          test -f "$script" || { echo "::error::This source has no release check ($script). Build a newer commit."; exit 1; }
+          gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --paginate \
+            --jq '.[] | {tag_name, draft, assets: [.assets[] | {name}]}' | jq -s . > "$RUNNER_TEMP/releases.json"
+          status=0
+          node "$script" --tag="$TAG" --releases="$RUNNER_TEMP/releases.json" | tee "$RUNNER_TEMP/check.txt" || status=$?
+          grep -E '^(launcher|gamegen)_version=[0-9A-Za-z.-]+$' "$RUNNER_TEMP/check.txt" >> "$GITHUB_OUTPUT" || true
+          exit "$status"
 
   gamegen:
     needs: validate
@@ -177,6 +298,13 @@ jobs:
             cp crates/target/release/runtime_owner_lease.exe "build-extras/agentloop-daemon/${{ matrix.key }}/"
           fi
 
+      # WINDOWS CODE SIGNING: NOT DONE YET. GameGen.exe and the launcher's
+      # installer are not signed by Microsoft (Authenticode), so SmartScreen
+      # warns. When a certificate exists, sign here for GameGen (before the
+      # archive is made) and in the launcher job after "Package the launcher"
+      # (before its artifact is uploaded): both must happen before `catalog` and
+      # `draft-release` hash and sign the files, for the reason given at the top.
+
       # The packager refuses a tree with uncommitted changes, so the package
       # is always exactly the checked-out commit.
       - name: Package GameGen
@@ -254,11 +382,127 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # Apple-signs GameGen for macOS. It runs here, on GitHub's Mac, even when
+  # GameGen was built on our own machines: the certificate never leaves this
+  # repository's secrets. The signed package REPLACES the unsigned one under
+  # the same artifact name, so every later job sees only the final bytes.
+  gamegen-apple:
+    name: Apple-sign GameGen
+    needs: [validate, gamegen, gamegen-prebuilt]
+    if: ${{ always() && needs.validate.outputs.apple == 'yes' && (needs.gamegen.result == 'success' || needs.gamegen-prebuilt.result == 'success') }}
+    runs-on: macos-15
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      TARGET: aarch64-apple-darwin
+    steps:
+      - name: Locate the signing script
+        run: echo "SIGN=$GITHUB_WORKSPACE/releases/.github/scripts/apple-sign.sh" >> "$GITHUB_ENV"
+
+      - name: Check out the signing script
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          path: releases
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
+      - name: Mint a read-only token for the source
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        id: source
+        with:
+          app-id: ${{ vars.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+          owner: trygentic
+          repositories: unrest
+          permission-contents: read
+
+      # Only the script that re-archives the package and rewrites its receipt.
+      - name: Check out the packaging tools
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          token: ${{ steps.source.outputs.token }}
+          ref: ${{ needs.gamegen-prebuilt.outputs.sha || inputs.source_ref }}
+          path: source
+          persist-credentials: false
+          sparse-checkout: agentloop/scripts
+
+      - name: Fetch the unsigned package
+        uses: actions/download-artifact@v5
+        with:
+          name: gamegen-${{ env.TARGET }}
+          path: ${{ runner.temp }}/unsigned
+
+      - name: Unpack it
+        run: |
+          set -euo pipefail
+          receipt="$RUNNER_TEMP/unsigned/gamegen-package-$TARGET.json"
+          root=$(jq -r .installLayout.root "$receipt")
+          [[ "$root" =~ ^GameGen-[0-9A-Za-z.-]+-macos-[0-9a-z_]+$ ]] || { echo "::error::unexpected package root"; exit 1; }
+          mkdir "$RUNNER_TEMP/work"
+          tar -xzf "$RUNNER_TEMP/unsigned/$root.tar.gz" -C "$RUNNER_TEMP/work"
+          test -d "$RUNNER_TEMP/work/$root/GameGen.app"
+          echo "PRODUCT=$RUNNER_TEMP/work/$root" >> "$GITHUB_ENV"
+          echo "RECEIPT=$receipt" >> "$GITHUB_ENV"
+
+      # The only step that holds the certificate. It goes into a keychain that
+      # exists for this job alone.
+      - name: Import the Developer ID certificate
+        env:
+          MAC_CERT_P12: ${{ secrets.MAC_CERT_P12 }}
+          MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
+        run: bash "$SIGN" import-cert
+
+      # Inside-out: the daemon, the memory helper, the Node runtime and every
+      # native add-on first, the app last. Helper programs get the entitlements
+      # that let JavaScript engines run under the hardened runtime.
+      - name: Sign GameGen.app
+        run: bash "$SIGN" sign "$PRODUCT/GameGen.app" "$GITHUB_WORKSPACE/releases/.github/scripts/helper-entitlements.plist"
+
+      # Fails the job, with Apple's log, if Apple says no.
+      - name: Notarize and staple
+        env:
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: bash "$SIGN" notarize "$PRODUCT/GameGen.app"
+
+      - name: Verify the signed app
+        run: bash "$SIGN" verify "$PRODUCT/GameGen.app"
+
+      # New archive, new receipt (size, hash). Then check the archive itself:
+      # what a user's launcher will unpack must still pass every check.
+      - name: Re-archive the signed app
+        run: |
+          set -euo pipefail
+          node source/agentloop/scripts/reseal-gamegen-package.mjs --receipt="$RECEIPT" --product="$PRODUCT" --output="$RUNNER_TEMP/signed"
+          mkdir "$RUNNER_TEMP/recheck"
+          tar -xzf "$RUNNER_TEMP/signed/$(basename "$PRODUCT").tar.gz" -C "$RUNNER_TEMP/recheck"
+          bash "$SIGN" verify "$RUNNER_TEMP/recheck/$(basename "$PRODUCT")/GameGen.app"
+          ls -l "$RUNNER_TEMP/signed"
+
+      - name: Replace the unsigned package with the signed one
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: gamegen-${{ env.TARGET }}
+          path: ${{ runner.temp }}/signed/
+          overwrite: true
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Delete the keychain
+        if: ${{ always() }}
+        run: bash "$SIGN" cleanup
+
   catalog:
     name: Sign GameGen and list it for the launcher
-    needs: [gamegen, gamegen-prebuilt]
+    # After gamegen-apple: these hashes and signatures must be of the archives
+    # as they ship. If Apple signing was wanted and failed, this does not run.
+    needs: [gamegen, gamegen-prebuilt, gamegen-apple]
     # Signed product lists only make sense for a real, tagged release.
-    if: ${{ always() && inputs.tag != '' && vars.UNREST_PRODUCT_PUBLIC_KEY != '' && (needs.gamegen.result == 'success' || needs.gamegen-prebuilt.result == 'success') }}
+    if: ${{ always() && inputs.tag != '' && vars.UNREST_PRODUCT_PUBLIC_KEY != '' && (needs.gamegen.result == 'success' || needs.gamegen-prebuilt.result == 'success') && (needs.gamegen-apple.result == 'success' || needs.gamegen-apple.result == 'skipped') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     defaults:
@@ -352,8 +596,8 @@ jobs:
 
   launcher:
     # Runs after the product list when there is one, and without it otherwise.
-    needs: [validate, catalog, gamegen-prebuilt]
-    if: ${{ always() && needs.validate.result == 'success' && (needs.catalog.result == 'success' || needs.catalog.result == 'skipped') && needs.gamegen-prebuilt.result != 'failure' }}
+    needs: [validate, catalog, gamegen-prebuilt, gamegen-apple]
+    if: ${{ always() && needs.validate.result == 'success' && (needs.catalog.result == 'success' || needs.catalog.result == 'skipped') && needs.gamegen-prebuilt.result != 'failure' && (needs.gamegen-apple.result == 'success' || needs.gamegen-apple.result == 'skipped') }}
     name: Launcher ${{ matrix.target }}
     strategy:
       fail-fast: false
@@ -364,16 +608,25 @@ jobs:
           - runner: windows-latest
             target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
+    timeout-minutes: 150
     defaults:
       run:
         shell: bash
         working-directory: unrest-launcher
+    env:
+      # "yes" only on the Mac, and only when Apple signing is configured.
+      APPLE: ${{ matrix.target == 'aarch64-apple-darwin' && needs.validate.outputs.apple || '' }}
     steps:
       # Outside the checkout, so the build output is easy to find and upload.
       - name: Choose the build folder
         working-directory: ${{ github.workspace }}
-        run: echo "CARGO_TARGET_DIR=$RUNNER_TEMP/launcher-target" >> "$GITHUB_ENV"
+        run: |
+          {
+            echo "CARGO_TARGET_DIR=$RUNNER_TEMP/launcher-target"
+            # Used by the Apple signing steps further down.
+            echo "APP=$RUNNER_TEMP/launcher-target/${{ matrix.target }}/release/bundle/macos/Unrest.app"
+            echo "SIGN=$GITHUB_WORKSPACE/release-tools/.github/scripts/apple-sign.sh"
+          } >> "$GITHUB_ENV"
 
       - name: Mint a read-only token for the source
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
@@ -457,6 +710,72 @@ jobs:
             bun scripts/package-beta.ts --target=${{ matrix.target }}
           fi
 
+      # ---- Apple signing (macOS only, when the five settings exist) ----
+      # The build above made an unsigned Unrest.app and archived it. Sign the
+      # app, have Apple notarize it, staple the ticket, then make the ZIP and
+      # the update archive AGAIN from the signed app: `draft-release` signs the
+      # update archive's exact bytes, so they must be the final ones.
+      # After the source checkout (which cleans the folder), in a folder of its
+      # own; the launcher build never looks there.
+      - name: Check out the signing script
+        if: ${{ env.APPLE == 'yes' }}
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          path: release-tools
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
+      # The only step that holds the certificate.
+      - name: Import the Developer ID certificate
+        if: ${{ env.APPLE == 'yes' }}
+        env:
+          MAC_CERT_P12: ${{ secrets.MAC_CERT_P12 }}
+          MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
+        run: bash "$SIGN" import-cert
+
+      # The launcher holds no helper programs and needs no entitlements.
+      - name: Sign Unrest.app
+        if: ${{ env.APPLE == 'yes' }}
+        run: bash "$SIGN" sign "$APP"
+
+      # Fails the job, with Apple's log, if Apple says no.
+      - name: Notarize and staple
+        if: ${{ env.APPLE == 'yes' }}
+        env:
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: bash "$SIGN" notarize "$APP"
+
+      - name: Verify the signed app
+        if: ${{ env.APPLE == 'yes' }}
+        run: bash "$SIGN" verify "$APP"
+
+      # Same archives as the build made, now of the signed app. Then unpack the
+      # ZIP and check that what a user downloads still passes every check.
+      - name: Re-archive the signed app
+        if: ${{ env.APPLE == 'yes' }}
+        env:
+          UNREST_UPDATER_PUBLIC_KEY: ${{ vars.UNREST_UPDATER_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$UNREST_UPDATER_PUBLIC_KEY" ]]; then
+            bun scripts/package-beta.ts --target=${{ matrix.target }} --updater --archive-only
+          else
+            unset UNREST_UPDATER_PUBLIC_KEY
+            bun scripts/package-beta.ts --target=${{ matrix.target }} --archive-only
+          fi
+          mkdir "$RUNNER_TEMP/recheck"
+          /usr/bin/ditto -x -k "$(dirname "$APP")"/*.zip "$RUNNER_TEMP/recheck"
+          bash "$SIGN" verify "$RUNNER_TEMP/recheck/Unrest.app"
+
+      - name: Delete the keychain
+        if: ${{ always() && env.APPLE == 'yes' }}
+        run: bash "$SIGN" cleanup
+
+      # WINDOWS CODE SIGNING: NOT DONE YET. Sign the NSIS installer here,
+      # before it is uploaded (see the note in the GameGen job).
+
       # macOS: the zipped app, plus its update archive when updates are on.
       # Windows: the NSIS installer, which is also the update archive.
       - name: Keep the package
@@ -472,8 +791,9 @@ jobs:
 
   draft-release:
     name: Draft release
-    needs: [gamegen, gamegen-prebuilt, launcher, catalog]
-    if: ${{ always() && inputs.tag != '' && (needs.gamegen.result == 'success' || needs.gamegen-prebuilt.result == 'success') && needs.launcher.result == 'success' && (needs.catalog.result == 'success' || needs.catalog.result == 'skipped') }}
+    needs: [validate, gamegen, gamegen-prebuilt, gamegen-apple, launcher, catalog]
+    # A failed Apple signing stops the release: nothing ships unsigned by accident.
+    if: ${{ always() && inputs.tag != '' && (needs.gamegen.result == 'success' || needs.gamegen-prebuilt.result == 'success') && (needs.gamegen-apple.result == 'success' || needs.gamegen-apple.result == 'skipped') && needs.launcher.result == 'success' && (needs.catalog.result == 'success' || needs.catalog.result == 'skipped') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -484,6 +804,8 @@ jobs:
     env:
       TAG: ${{ inputs.tag }}
       SIGN_UPDATES: ${{ vars.UNREST_UPDATER_PUBLIC_KEY != '' && 'yes' || '' }}
+      APPLE: ${{ needs.validate.outputs.apple }}
+      LAUNCHER_VERSION: ${{ needs.validate.outputs.launcher_version }}
     steps:
       - name: Collect the packages
         uses: actions/download-artifact@v5
@@ -574,8 +896,16 @@ jobs:
           ls -l
           sha256sum * > SHA256SUMS
           cat SHA256SUMS
+          # The tag names the launcher release; GameGen's own version comes
+          # from the packages themselves.
+          gamegen=$(jq -r .version gamegen-package-*.json | sort -u | paste -sd, -)
+          if [[ "$APPLE" == "yes" ]]; then
+            signing="The macOS apps are signed and notarized by Apple. The Windows apps are not signed by Microsoft yet: SmartScreen will warn; choose More info, then Run anyway."
+          else
+            signing="Not yet signed by Apple or Microsoft. macOS: right-click the app and choose Open the first time. Windows: SmartScreen will warn; choose More info, then Run anyway."
+          fi
           gh release create "$TAG" * \
             --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
             --draft --prerelease \
             --title "Unrest ${TAG#v}" \
-            --notes "Beta build, not yet signed by Apple or Microsoft. macOS: right-click the app and choose Open the first time. Check downloads against SHA256SUMS before running them."
+            --notes "Beta build. Unrest Launcher ${LAUNCHER_VERSION:-${TAG#v}} with GameGen ${gamegen}. ${signing} Check downloads against SHA256SUMS before running them."
