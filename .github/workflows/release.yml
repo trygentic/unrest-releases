@@ -676,6 +676,8 @@ jobs:
             unrest-launcher
             packages
             agentloop/scripts
+            # The launcher's release tests read GameGen's version file.
+            agentloop/src/products/gamegen
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
@@ -797,6 +799,8 @@ jobs:
             unrest-launcher
             packages
             agentloop/scripts
+            # The launcher's release tests read GameGen's version file.
+            agentloop/src/products/gamegen
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
@@ -1030,6 +1034,8 @@ jobs:
             unrest-launcher
             packages
             agentloop/scripts
+            # The launcher's release tests read GameGen's version file.
+            agentloop/src/products/gamegen
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         if: ${{ env.SIGN_UPDATES == 'yes' }}
