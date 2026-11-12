@@ -61,6 +61,14 @@ on:
         description: 'Optional. Run ID of a successful "Release (self-hosted)" run on main in trygentic/unrest. GameGen is then taken from that run instead of being built here; the launcher is still built, and everything is signed, here.'
         required: false
         type: string
+      platforms:
+        description: 'Which platforms this release ships. "macos": no Windows GameGen and no Windows launcher are built, listed or released.'
+        required: false
+        type: choice
+        options:
+          - all
+          - macos
+        default: all
       skip_apple_signing:
         description: 'Ship the macOS apps WITHOUT Apple signing even though the Apple settings exist. Only for a deliberate unsigned build; users will see a Gatekeeper warning.'
         required: false
@@ -99,6 +107,7 @@ jobs:
           REF: ${{ inputs.source_ref }}
           TAG: ${{ inputs.tag }}
           RUN: ${{ inputs.gamegen_run_id }}
+          PLATFORMS: ${{ inputs.platforms }}
         run: |
           if [[ "$REF" != "main" && ! "$REF" =~ ^v[0-9] && ! "$REF" =~ ^[0-9a-f]{7,40}$ ]]; then
             echo "::error::source_ref must be main, a v* tag or a commit SHA"; exit 1
@@ -108,6 +117,12 @@ jobs:
           fi
           if [[ -n "$RUN" && ! "$RUN" =~ ^[0-9]+$ ]]; then
             echo "::error::gamegen_run_id must be a number"; exit 1
+          fi
+          if [[ "$PLATFORMS" == "macos" ]]; then
+            echo "Platforms in this run: macOS (Apple Silicon) only. No Windows GameGen and no Windows launcher."
+            echo "::notice::macOS-only release: nothing for Windows is built, listed or released."
+          else
+            echo "Platforms in this run: macOS (Apple Silicon) and Windows (x64)."
           fi
 
       # Apple signing needs all five settings. None: the apps ship unsigned, as
@@ -188,10 +203,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.tag }}
+          PLATFORMS: ${{ inputs.platforms }}
         run: |
           set -euo pipefail
           script=unrest-launcher/scripts/release/check-release.mjs
           test -f "$script" || { echo "::error::This source has no release check ($script). Build a newer commit."; exit 1; }
+          # A macOS-only release needs the source's macOS-only update manifest.
+          # Find out now, not after an hour of building.
+          if [[ "$PLATFORMS" == "macos" ]] && ! grep -q -- '--macos-only' unrest-launcher/scripts/release/create-launcher-manifest.ts; then
+            echo "::error::This source cannot write a macOS-only update manifest (create-launcher-manifest.ts has no --macos-only). Build a newer commit."; exit 1
+          fi
           gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --paginate \
             --jq '.[] | {tag_name, draft, assets: [.assets[] | {name}]}' | jq -s . > "$RUNNER_TEMP/releases.json"
           status=0
@@ -206,15 +227,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - runner: macos-15
-            target: aarch64-apple-darwin
-            key: darwin-arm64
-            exe: ''
-          - runner: windows-latest
-            target: x86_64-pc-windows-msvc
-            key: win32-x64
-            exe: '.exe'
+        # macOS always; Windows unless this is a macOS-only release
+        # (`platforms: macos`). Each entry: the runner, the Rust target, the
+        # folder key the packager uses, and the executable suffix.
+        include: >-
+          ${{ fromJSON(inputs.platforms == 'macos'
+          && '[{"runner":"macos-15","target":"aarch64-apple-darwin","key":"darwin-arm64","exe":""}]'
+          || '[{"runner":"macos-15","target":"aarch64-apple-darwin","key":"darwin-arm64","exe":""},{"runner":"windows-latest","target":"x86_64-pc-windows-msvc","key":"win32-x64","exe":".exe"}]') }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 150
     defaults:
@@ -375,7 +394,9 @@ jobs:
           path: ${{ runner.temp }}/gamegen/gamegen-aarch64-apple-darwin/
           if-no-files-found: error
           retention-days: 14
+      # Not passed on in a macOS-only release, so nothing later can list or ship it.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: ${{ inputs.platforms != 'macos' }}
         with:
           name: gamegen-x86_64-pc-windows-msvc
           path: ${{ runner.temp }}/gamegen/gamegen-x86_64-pc-windows-msvc/
@@ -602,11 +623,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - runner: macos-15
-            target: aarch64-apple-darwin
-          - runner: windows-latest
-            target: x86_64-pc-windows-msvc
+        # macOS always; Windows unless this is a macOS-only release.
+        include: >-
+          ${{ fromJSON(inputs.platforms == 'macos'
+          && '[{"runner":"macos-15","target":"aarch64-apple-darwin"}]'
+          || '[{"runner":"macos-15","target":"aarch64-apple-darwin"},{"runner":"windows-latest","target":"x86_64-pc-windows-msvc"}]') }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 150
     defaults:
@@ -806,6 +827,8 @@ jobs:
       SIGN_UPDATES: ${{ vars.UNREST_UPDATER_PUBLIC_KEY != '' && 'yes' || '' }}
       APPLE: ${{ needs.validate.outputs.apple }}
       LAUNCHER_VERSION: ${{ needs.validate.outputs.launcher_version }}
+      # "macos": the release holds nothing for Windows, and no step may expect it.
+      PLATFORMS: ${{ inputs.platforms }}
     steps:
       - name: Collect the packages
         uses: actions/download-artifact@v5
@@ -837,10 +860,16 @@ jobs:
             fi
           }
           need "macOS launcher ZIP" 'Unrest_*-inspection.zip'
-          need "Windows launcher installer" 'Unrest_*-setup.exe'
           if [[ "$SIGN_UPDATES" == "yes" ]]; then need "macOS launcher update archive" 'Unrest.app.tar.gz'; fi
           need "macOS GameGen receipt" 'gamegen-package-*-apple-darwin.json'
-          need "Windows GameGen receipt" 'gamegen-package-*-windows-msvc.json'
+          if [[ "$PLATFORMS" == "macos" ]]; then
+            # A macOS-only release must hold nothing for Windows at all.
+            stray=$(find . -maxdepth 1 -type f \( -name '*.exe' -o -name '*windows*' \) | sort)
+            if [[ -n "$stray" ]]; then echo "::error::a macOS-only release must not hold Windows files: $(echo "$stray" | tr '\n' ' ')"; missing=1; fi
+          else
+            need "Windows launcher installer" 'Unrest_*-setup.exe'
+            need "Windows GameGen receipt" 'gamegen-package-*-windows-msvc.json'
+          fi
           # Each receipt names its archive; a product list implies its signature too.
           for receipt in gamegen-package-*.json; do
             [[ -f "$receipt" ]] || continue
@@ -900,7 +929,10 @@ jobs:
         run: |
           set -euo pipefail
           version=$(jq -r .version package.json)
-          for archive in "$GITHUB_WORKSPACE"/packages/Unrest.app.tar.gz "$GITHUB_WORKSPACE"/packages/*-setup.exe; do
+          # macOS: the app archive. Windows: the installer, unless this release has none.
+          archives=("$GITHUB_WORKSPACE/packages/Unrest.app.tar.gz")
+          if [[ "$PLATFORMS" != "macos" ]]; then archives+=("$GITHUB_WORKSPACE"/packages/*-setup.exe); fi
+          for archive in "${archives[@]}"; do
             if [[ ! -f "$archive" ]]; then
               echo "::error::update archive not found: $archive"; ls -l "$GITHUB_WORKSPACE/packages"; exit 1
             fi
@@ -921,12 +953,20 @@ jobs:
           set -euo pipefail
           p="$GITHUB_WORKSPACE/packages"
           base="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG"
-          exe=$(basename "$p"/*-setup.exe)
-          jq -n --arg p "$p" --arg base "$base" --arg exe "$exe" '[
-            {platform: "darwin-aarch64", artifact: ($p + "/Unrest.app.tar.gz"), signatureFile: ($p + "/Unrest.app.tar.gz.sig"), url: ($base + "/Unrest.app.tar.gz")},
-            {platform: "windows-x86_64", artifact: ($p + "/" + $exe), signatureFile: ($p + "/" + $exe + ".sig"), url: ($base + "/" + $exe)}
-          ]' > "$RUNNER_TEMP/artifacts.json"
-          bun scripts/release/create-launcher-manifest.ts "$RUNNER_TEMP/artifacts.json" "$(jq -r .version package.json)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$p/latest.json"
+          mac=$(jq -n --arg p "$p" --arg base "$base" \
+            '{platform: "darwin-aarch64", artifact: ($p + "/Unrest.app.tar.gz"), signatureFile: ($p + "/Unrest.app.tar.gz.sig"), url: ($base + "/Unrest.app.tar.gz")}')
+          if [[ "$PLATFORMS" == "macos" ]]; then
+            # Only the macOS entry. A launcher on another platform finds no
+            # update for itself in this file and stays as it is.
+            jq -n --argjson mac "$mac" '[$mac]' > "$RUNNER_TEMP/artifacts.json"
+            only="--macos-only"
+          else
+            exe=$(basename "$p"/*-setup.exe)
+            jq -n --argjson mac "$mac" --arg p "$p" --arg base "$base" --arg exe "$exe" \
+              '[$mac, {platform: "windows-x86_64", artifact: ($p + "/" + $exe), signatureFile: ($p + "/" + $exe + ".sig"), url: ($base + "/" + $exe)}]' > "$RUNNER_TEMP/artifacts.json"
+            only=""
+          fi
+          bun scripts/release/create-launcher-manifest.ts "$RUNNER_TEMP/artifacts.json" "$(jq -r .version package.json)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$p/latest.json" $only
 
       # A draft is visible only to people with write access to this repository.
       # Marking it public is a manual step after the smoke test.
@@ -937,18 +977,28 @@ jobs:
           set -euo pipefail
           cd packages
           ls -l
+          # Covers the files of this run. A file added to the release later is
+          # not in it: add its line by hand (see the runbook, "Adding a file to
+          # the draft"). Nothing here ever removes or replaces a release asset.
           sha256sum * > SHA256SUMS
           cat SHA256SUMS
           # The tag names the launcher release; GameGen's own version comes
           # from the packages themselves.
           gamegen=$(jq -r .version gamegen-package-*.json | sort -u | paste -sd, -)
-          if [[ "$APPLE" == "yes" ]]; then
-            signing="The macOS apps are signed and notarized by Apple. The Windows apps are not signed by Microsoft yet: SmartScreen will warn; choose More info, then Run anyway."
+          if [[ "$PLATFORMS" == "macos" ]]; then
+            platforms="For macOS (Apple Silicon). A Windows version is coming; this release has no Windows downloads."
+            if [[ "$APPLE" == "yes" ]]; then signing="The apps are signed and notarized by Apple."
+            else signing="Not yet signed by Apple: right-click the app and choose Open the first time."; fi
           else
-            signing="Not yet signed by Apple or Microsoft. macOS: right-click the app and choose Open the first time. Windows: SmartScreen will warn; choose More info, then Run anyway."
+            platforms="For macOS (Apple Silicon) and Windows (x64)."
+            if [[ "$APPLE" == "yes" ]]; then
+              signing="The macOS apps are signed and notarized by Apple. The Windows apps are not signed by Microsoft yet: SmartScreen will warn; choose More info, then Run anyway."
+            else
+              signing="Not yet signed by Apple or Microsoft. macOS: right-click the app and choose Open the first time. Windows: SmartScreen will warn; choose More info, then Run anyway."
+            fi
           fi
           gh release create "$TAG" * \
             --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
             --draft --prerelease \
             --title "Unrest ${TAG#v}" \
-            --notes "Beta build. Unrest Launcher ${LAUNCHER_VERSION:-${TAG#v}} with GameGen ${gamegen}. ${signing} Check downloads against SHA256SUMS before running them."
+            --notes "Beta build. Unrest Launcher ${LAUNCHER_VERSION:-${TAG#v}} with GameGen ${gamegen}. ${platforms} ${signing} Check downloads against SHA256SUMS before running them."
