@@ -1,0 +1,40 @@
+name: Check Apple signing
+
+# Check repaired credentials and account agreements without rebuilding apps.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  apple-preflight:
+    name: Check the Apple settings
+    runs-on: macos-15
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out the signing script
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
+      - name: Import the Developer ID certificate
+        env:
+          MAC_CERT_P12: ${{ secrets.MAC_CERT_P12 }}
+          MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
+        run: bash .github/scripts/apple-sign.sh import-cert
+
+      - name: Ask Apple whether the notarization key works
+        env:
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: bash .github/scripts/apple-sign.sh check-notary
+
+      - name: Delete the temporary keychain and key file
+        if: ${{ always() }}
+        run: bash .github/scripts/apple-sign.sh cleanup
